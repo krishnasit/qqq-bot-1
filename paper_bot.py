@@ -1,0 +1,293 @@
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import logging
+import os
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+import pandas as pd
+from dotenv import load_dotenv
+from alpaca.data.enums import DataFeed
+from alpaca.data.historical.stock import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+from alpaca.trading.client import TradingClient
+from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce, QueryOrderStatus
+from alpaca.trading.requests import MarketOrderRequest, StopLossRequest, TakeProfitRequest
+
+from backtester import prepare_strategy_frame, near_ema
+from config import StrategyConfig
+from patterns import detect_pattern
+
+load_dotenv()
+LOG = logging.getLogger("paper_bot")
+
+
+def final_config() -> StrategyConfig:
+    return StrategyConfig(
+        symbol=os.getenv("BOT_SYMBOL", "QQQ"),
+        timeframe_minutes=5,
+        london_timezone="Europe/London",
+        bias_start_hour=8,
+        bias_start_minute=0,
+        no_trade_buffer_minutes=90,
+        trend_sma_length=200,
+        entry_ema_length=50,
+        ema_confluence_pct=0.8,
+        atr_length=20,
+        atr_stop_buffer_mult=0.25,
+        rr_target=1.5,
+        trailing_stop_enabled=False,
+        trailing_atr_mult=1.0,
+        enabled_patterns=["engulfing"],
+        initial_capital=10000.0,
+    )
+
+
+def get_clients():
+    key = os.getenv("ALPACA_API_KEY")
+    secret = os.getenv("ALPACA_SECRET_KEY")
+    if not key or not secret:
+        raise RuntimeError("Missing ALPACA_API_KEY or ALPACA_SECRET_KEY in environment/.env")
+
+    paper_flag = os.getenv("ALPACA_PAPER", "true").strip().lower()
+    if paper_flag not in {"1", "true", "yes", "on"}:
+        raise RuntimeError("This script is intentionally paper-only. Set ALPACA_PAPER=true.")
+
+    trading = TradingClient(key, secret, paper=True)
+    market_data = StockHistoricalDataClient(key, secret)
+    return trading, market_data
+
+
+def in_regular_session() -> bool:
+    now = datetime.now(timezone.utc)
+    minutes = now.hour * 60 + now.minute
+    return now.weekday() < 5 and (13 * 60 + 30) <= minutes < (20 * 60)
+
+
+def fetch_recent_bars(data_client, symbol: str, lookback_days: int = 10, limit: int = 500) -> pd.DataFrame:
+    end = datetime.now(timezone.utc)
+    start = end - pd.Timedelta(days=lookback_days).to_pytimedelta()
+
+    req = StockBarsRequest(
+        symbol_or_symbols=symbol,
+        timeframe=TimeFrame(5, TimeFrameUnit.Minute),
+        start=start,
+        end=end,
+        feed=DataFeed.IEX,
+    )
+    bars = data_client.get_stock_bars(req).df
+
+    if bars is None or bars.empty:
+        raise RuntimeError("No recent bars returned from Alpaca.")
+
+    if isinstance(bars.index, pd.MultiIndex):
+        bars = bars.reset_index()
+
+    if "symbol" in bars.columns:
+        bars = bars[bars["symbol"] == symbol].copy()
+
+    out = bars[["timestamp", "open", "high", "low", "close", "volume"]].copy()
+    out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True)
+    out = out.set_index("timestamp").sort_index().tail(limit)
+    return out
+
+
+def get_open_orders(trading_client, symbol: str):
+    try:
+        orders = trading_client.get_orders(filter=QueryOrderStatus.OPEN, limit=100)
+    except TypeError:
+        orders = trading_client.get_orders(status="open", limit=100)
+    return [o for o in orders if getattr(o, "symbol", None) == symbol]
+
+
+def get_open_position(trading_client, symbol: str):
+    try:
+        return trading_client.get_open_position(symbol)
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "position does not exist" in msg or "not found" in msg or "404" in msg:
+            return None
+        raise
+
+
+def signal_to_order(latest_complete_df: pd.DataFrame, config: StrategyConfig):
+    frame = prepare_strategy_frame(latest_complete_df, config)
+
+    if len(frame) < 3:
+        return None
+
+    i = len(frame) - 1
+    row = frame.iloc[i]
+    ts = frame.index[i]
+
+    if not bool(row.get("after_buffer", False)):
+        return None
+
+    bias = row.get("bias")
+    if pd.isna(bias) or bias is None:
+        return None
+
+    if not near_ema(row, config.ema_confluence_pct):
+        return None
+
+    pattern = detect_pattern(frame, i, bias, config.enabled_patterns)
+    if not pattern:
+        return None
+
+    if pd.isna(row.get("atr")):
+        return None
+
+    entry = float(row["close"])
+    atr_buffer = float(row["atr"]) * float(config.atr_stop_buffer_mult)
+
+    if bias == "long":
+        stop = float(row["low"]) - atr_buffer
+        target = entry + (entry - stop) * float(config.rr_target)
+        side = OrderSide.BUY
+        side_label = "long"
+    else:
+        stop = float(row["high"]) + atr_buffer
+        target = entry - (stop - entry) * float(config.rr_target)
+        side = OrderSide.SELL
+        side_label = "short"
+
+    risk = abs(entry - stop)
+    if risk <= 0 or stop <= 0 or target <= 0:
+        return None
+
+    raw = f"{config.symbol}:{side_label}:{ts.isoformat()}".encode()
+    client_order_id = "qlb-" + hashlib.sha256(raw).hexdigest()[:24]
+
+    return {
+        "signal_timestamp": ts,
+        "symbol": config.symbol,
+        "side": side,
+        "side_label": side_label,
+        "entry_reference": round(entry, 4),
+        "stop": round(stop, 2),
+        "target": round(target, 2),
+        "pattern": pattern,
+        "client_order_id": client_order_id,
+    }
+
+
+def append_log(csv_path: str, row: dict):
+    path = Path(csv_path)
+    fields = [
+        "logged_at",
+        "event",
+        "symbol",
+        "signal_timestamp",
+        "side",
+        "entry_reference",
+        "stop",
+        "target",
+        "pattern",
+        "client_order_id",
+        "broker_order_id",
+        "message",
+    ]
+
+    exists = path.exists()
+    with path.open("a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        if not exists:
+            writer.writeheader()
+        writer.writerow({k: row.get(k, "") for k in fields})
+
+
+def execute_once() -> int:
+    config = final_config()
+    trading_client, data_client = get_clients()
+    log_path = os.getenv("BOT_LOG_PATH", "paper_trades.csv")
+
+    if not in_regular_session():
+        LOG.info("Outside regular US session. No action taken.")
+        return 0
+
+    open_position = get_open_position(trading_client, config.symbol)
+    open_orders = get_open_orders(trading_client, config.symbol)
+
+    if open_position is not None:
+        LOG.info("Existing open position detected for %s. No new order sent.", config.symbol)
+        return 0
+
+    if open_orders:
+        LOG.info("Existing open order(s) detected for %s. No new order sent.", config.symbol)
+        return 0
+
+    bars = fetch_recent_bars(data_client, config.symbol)
+    if len(bars) < 4:
+        LOG.info("Not enough bars yet.")
+        return 0
+
+    latest_complete = bars.iloc[:-1].copy()
+    order_signal = signal_to_order(latest_complete, config)
+
+    if order_signal is None:
+        LOG.info("No valid signal on the latest completed candle.")
+        return 0
+
+    req = MarketOrderRequest(
+        symbol=config.symbol,
+        qty=float(os.getenv("BOT_QTY", "1")),
+        side=order_signal["side"],
+        time_in_force=TimeInForce.DAY,
+        order_class=OrderClass.BRACKET,
+        take_profit=TakeProfitRequest(limit_price=order_signal["target"]),
+        stop_loss=StopLossRequest(stop_price=order_signal["stop"]),
+        client_order_id=order_signal["client_order_id"],
+    )
+
+    order = trading_client.submit_order(req)
+
+    log_row = {
+        "logged_at": datetime.now(timezone.utc).isoformat(),
+        "event": "bracket_order_submitted",
+        "symbol": config.symbol,
+        "signal_timestamp": order_signal["signal_timestamp"].isoformat(),
+        "side": order_signal["side_label"],
+        "entry_reference": order_signal["entry_reference"],
+        "stop": order_signal["stop"],
+        "target": order_signal["target"],
+        "pattern": order_signal["pattern"],
+        "client_order_id": order_signal["client_order_id"],
+        "broker_order_id": str(getattr(order, "id", "")),
+        "message": "Paper bracket order submitted",
+    }
+    append_log(log_path, log_row)
+    LOG.warning("PAPER ORDER SUBMITTED: %s", log_row)
+    return 1
+
+
+def main():
+    parser = argparse.ArgumentParser(description="QQQ London Bias Alpaca paper bot")
+    parser.add_argument("--once", action="store_true", help="Run one evaluation cycle")
+    parser.add_argument("--loop", action="store_true", help="Run continuously")
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    if args.once == args.loop:
+        parser.error("Choose exactly one of --once or --loop")
+
+    if args.once:
+        execute_once()
+        return
+
+    poll_seconds = max(30, int(os.getenv("BOT_POLL_SECONDS", "60")))
+    while True:
+        try:
+            execute_once()
+        except Exception:
+            LOG.exception("Paper bot cycle failed.")
+        time.sleep(poll_seconds)
+
+
+if __name__ == "__main__":
+    main()

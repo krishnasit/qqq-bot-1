@@ -1,0 +1,24 @@
+# QQQ London Bias Backtester
+
+A local Streamlit backtester for your 5-minute QQQ strategy.
+
+## Included logic
+- London session start reference price
+- 90-minute London no-trade bias buffer
+- Bias must stay valid continuously after the buffer
+- Intraday VWAP
+- 200 SMA bias filter
+- Configurable EMA pullback entries
+- Hammer, engulfing, and tweezer patterns
+- ATR stop buffer, optional trailing stop, fixed RR target
+- Trade log, equity curve, drawdown, weekly and monthly performance
+
+## Local setup
+```bash
+cd /private/tmp/qqq-backtester-local
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+streamlit run app.py
+```

@@ -1,0 +1,215 @@
+from datetime import datetime, timedelta
+
+import plotly.express as px
+import streamlit as st
+
+from config import StrategyConfig
+from data_loader import fetch_alpaca_historical_candles, fetch_finnhub_live_quote
+from backtester import run_backtest, summarize_results
+
+
+st.set_page_config(page_title='QQQ London Bias Backtester', layout='wide')
+
+st.title('QQQ London Bias Backtester')
+st.caption(
+    '5-minute QQQ backtester with London bias, TradingView-style intraday VWAP, '
+    '200 SMA trend filter, EMA pullback entries, candle patterns, and trade analytics.'
+)
+
+with st.sidebar:
+    st.header('API Keys')
+    alpaca_api_key = st.text_input('Alpaca API Key', type='password')
+    alpaca_api_secret = st.text_input('Alpaca Secret Key', type='password')
+    finnhub_api_key = st.text_input('Finnhub API Key', type='password')
+
+    st.header('Data')
+    symbol = st.text_input('Symbol', value='QQQ')
+    end_date = st.date_input('End date', value=datetime.utcnow().date())
+    lookback_days = st.slider('Lookback days', 5, 365, 90)
+
+    st.header('Bias setup')
+    no_trade_buffer = st.slider('London no-trade buffer (minutes)', 30, 180, 90, 5)
+    sma_length = st.slider('Trend SMA length', 50, 400, 200)
+
+    st.header('Entry setup')
+    ema_length = st.slider('Entry EMA length', 5, 200, 50)
+    ema_confluence_pct = st.slider('EMA confluence (%)', 0.05, 2.0, 0.5, 0.05)
+    enabled_patterns = st.multiselect(
+        'Enabled patterns',
+        ['hammer', 'engulfing', 'tweezer'],
+        default=['hammer', 'engulfing', 'tweezer']
+    )
+
+    st.header('Risk management')
+    atr_length = st.slider('ATR length', 5, 50, 14)
+    atr_stop_buffer_mult = st.slider('ATR stop buffer multiplier', 0.0, 2.0, 0.1, 0.05)
+    rr_target = st.slider('Reward/Risk target', 0.5, 5.0, 1.5, 0.1)
+    trailing_stop_enabled = st.checkbox('Trailing stop enabled', value=False)
+    trailing_atr_mult = st.slider('Trailing stop ATR multiplier', 0.1, 5.0, 1.0, 0.1)
+
+    run = st.button('Run backtest', type='primary')
+
+cfg = StrategyConfig(
+    symbol=symbol,
+    no_trade_buffer_minutes=no_trade_buffer,
+    trend_sma_length=sma_length,
+    entry_ema_length=ema_length,
+    ema_confluence_pct=ema_confluence_pct,
+    atr_length=atr_length,
+    atr_stop_buffer_mult=atr_stop_buffer_mult,
+    rr_target=rr_target,
+    trailing_stop_enabled=trailing_stop_enabled,
+    trailing_atr_mult=trailing_atr_mult,
+    enabled_patterns=enabled_patterns,
+)
+
+if run:
+    try:
+        start = datetime.combine(end_date - timedelta(days=lookback_days), datetime.min.time())
+        end = datetime.combine(end_date + timedelta(days=1), datetime.min.time())
+
+        with st.spinner('Fetching Alpaca historical data and running backtest...'):
+            df = fetch_alpaca_historical_candles(
+                symbol=symbol,
+                start=start,
+                end=end,
+                api_key=alpaca_api_key or None,
+                api_secret=alpaca_api_secret or None
+            )
+            trades_df, eq_df, strategy_df = run_backtest(df, cfg)
+            summary = summarize_results(trades_df, eq_df)
+
+        st.subheader('Debug funnel')
+        d1, d2, d3, d4, d5 = st.columns(5)
+        d1.metric('Total bars', strategy_df.attrs.get('total_bars', 0))
+        d2.metric('After buffer', strategy_df.attrs.get('after_buffer_bars', 0))
+        d3.metric('With bias', strategy_df.attrs.get('bars_with_bias', 0))
+        d4.metric('Near EMA', strategy_df.attrs.get('near_ema_bars', 0))
+        d5.metric('Pattern match', strategy_df.attrs.get('pattern_match_bars', 0))
+
+        d6, d7, d8, d9 = st.columns(4)
+        d6.metric('Entries created', strategy_df.attrs.get('entries_created', 0))
+        d7.metric('Blocked no bias', strategy_df.attrs.get('blocked_no_bias', 0))
+        d8.metric('Blocked not near EMA', strategy_df.attrs.get('blocked_not_near_ema', 0))
+        d9.metric('Blocked no pattern', strategy_df.attrs.get('blocked_no_pattern', 0))
+
+        st.subheader('Live price snapshot')
+        try:
+            live_quote = fetch_finnhub_live_quote(symbol=symbol, api_key=finnhub_api_key or None)
+            q1, q2, q3, q4, q5 = st.columns(5)
+            q1.metric('Live', live_quote.get('current'))
+            q2.metric('Open', live_quote.get('open'))
+            q3.metric('High', live_quote.get('high'))
+            q4.metric('Low', live_quote.get('low'))
+            q5.metric('Prev Close', live_quote.get('prev_close'))
+        except Exception as live_err:
+            st.warning(f'Live Finnhub quote unavailable: {live_err}')
+
+        c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+        c1.metric('Trades', summary['trades'])
+        c2.metric('Win rate %', summary['win_rate'])
+        c3.metric('Avg R', summary['avg_r'])
+        c4.metric('Total R', summary['total_r'])
+        c5.metric('Profit factor', summary['profit_factor'])
+        c6.metric('Max drawdown %', summary['max_drawdown_pct'])
+        c7.metric('Best / Worst R', f"{summary['best_trade_r']} / {summary['worst_trade_r']}")
+
+        if not eq_df.empty:
+            left, right = st.columns(2)
+
+            with left:
+                eq_fig = px.line(
+                    eq_df.reset_index(),
+                    x='timestamp',
+                    y='equity',
+                    title='Equity curve'
+                )
+                st.plotly_chart(eq_fig, use_container_width=True)
+
+            with right:
+                dd_fig = px.area(
+                    eq_df.reset_index(),
+                    x='timestamp',
+                    y='drawdown_pct',
+                    title='Drawdown %'
+                )
+                st.plotly_chart(dd_fig, use_container_width=True)
+
+        if not trades_df.empty:
+            st.subheader('Trade analysis')
+            tabs = st.tabs(['Trades', 'Monthly', 'Weekly', 'Patterns'])
+
+            with tabs[0]:
+                st.dataframe(trades_df, use_container_width=True)
+
+            with tabs[1]:
+                st.dataframe(summary['monthly'], use_container_width=True)
+                monthly_fig = px.bar(
+                    summary['monthly'],
+                    x='month',
+                    y='total_r',
+                    title='Monthly total R'
+                )
+                st.plotly_chart(monthly_fig, use_container_width=True)
+
+            with tabs[2]:
+                st.dataframe(summary['weekly'], use_container_width=True)
+                weekly_fig = px.bar(
+                    summary['weekly'],
+                    x='week',
+                    y='total_r',
+                    title='Weekly total R'
+                )
+                st.plotly_chart(weekly_fig, use_container_width=True)
+
+            with tabs[3]:
+                st.dataframe(summary['by_pattern'], use_container_width=True)
+                pattern_fig = px.histogram(
+                    trades_df,
+                    x='pattern',
+                    color='side',
+                    barmode='group',
+                    title='Trades by pattern and side'
+                )
+                st.plotly_chart(pattern_fig, use_container_width=True)
+        else:
+            st.info('No trades found for the selected settings.')
+
+        st.subheader('Processed strategy data sample')
+        preview_cols = [
+            'close',
+            'vwap',
+            'sma_200',
+            'ema_entry',
+            'london_start_price',
+            'raw_bias',
+            'bias',
+            'ema_distance_pct',
+            'after_buffer',
+            'london_hm'
+        ]
+        existing_preview_cols = [c for c in preview_cols if c in strategy_df.columns]
+        st.dataframe(strategy_df[existing_preview_cols].tail(100), use_container_width=True)
+
+        st.subheader('Bias diagnostics')
+        diag_cols = [
+            'close',
+            'vwap',
+            'sma_200',
+            'london_start_price',
+            'raw_bias',
+            'bias',
+            'after_buffer',
+            'london_hm'
+        ]
+        existing_diag_cols = [c for c in diag_cols if c in strategy_df.columns]
+        st.dataframe(strategy_df[existing_diag_cols].tail(200), use_container_width=True)
+
+        with st.expander('Current config'):
+            st.json(cfg.__dict__)
+
+    except Exception as e:
+        st.error(f'Backtest failed: {e}')
+
+else:
+    st.info('Enter API keys in the sidebar, set parameters, then run the backtest.')
