@@ -4,3 +4,5 @@ paper_bot_state.json
 paper_trades.csv
 .venv/
 __pycache__/
+*.bak.*
+*.code-workspace
