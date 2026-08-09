@@ -3,10 +3,11 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import json
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -16,10 +17,10 @@ from alpaca.data.historical.stock import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce, QueryOrderStatus
+from alpaca.trading.enums import OrderClass, OrderSide, QueryOrderStatus, TimeInForce
 from alpaca.trading.requests import MarketOrderRequest, StopLossRequest, TakeProfitRequest
 
-from backtester import prepare_strategy_frame, near_ema
+from backtester import near_ema, prepare_strategy_frame
 from config import StrategyConfig
 from patterns import detect_pattern
 
@@ -46,6 +47,36 @@ def final_config() -> StrategyConfig:
         enabled_patterns=["engulfing"],
         initial_capital=10000.0,
     )
+
+
+def state_path() -> Path:
+    return Path(os.getenv("BOT_STATE_PATH", "paper_bot_state.json"))
+
+
+def load_state() -> dict:
+    path = state_path()
+    if not path.exists():
+        return {"loss_streak": 0, "last_loss_order_id": "", "last_trade_day": "", "trades_today": 0}
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {"loss_streak": 0, "last_loss_order_id": "", "last_trade_day": "", "trades_today": 0}
+
+
+def save_state(state: dict) -> None:
+    state_path().write_text(json.dumps(state, indent=2, sort_keys=True))
+
+
+def today_key() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def reset_daily_counters_if_needed(state: dict) -> dict:
+    today = today_key()
+    if state.get("last_trade_day") != today:
+        state["last_trade_day"] = today
+        state["trades_today"] = 0
+    return state
 
 
 def get_clients():
@@ -113,6 +144,169 @@ def get_open_position(trading_client, symbol: str):
         if "position does not exist" in msg or "not found" in msg or "404" in msg:
             return None
         raise
+
+
+def _safe_attr(obj, *names, default=None):
+    for name in names:
+        if hasattr(obj, name):
+            value = getattr(obj, name)
+            if value is not None:
+                return value
+    return default
+
+
+def _to_float(value):
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _normalize_side(value) -> str:
+    if value is None:
+        return ""
+    s = str(value).lower()
+    if "buy" in s:
+        return "buy"
+    if "sell" in s:
+        return "sell"
+    return s
+
+
+def get_recent_closed_orders(trading_client, symbol: str, days_back: int = 5):
+    after = (datetime.now(timezone.utc) - timedelta(days=days_back)).isoformat()
+    orders = []
+    try:
+        from alpaca.trading.requests import GetOrdersRequest
+        from alpaca.trading.enums import QueryOrderStatus
+
+        try:
+            req = GetOrdersRequest(
+                status=QueryOrderStatus.CLOSED,
+                after=after,
+                limit=200,
+                nested=True,
+            )
+        except TypeError:
+            req = GetOrdersRequest(
+                status=QueryOrderStatus.CLOSED,
+                limit=200,
+                nested=True,
+            )
+
+        orders = trading_client.get_orders(filter=req)
+    except Exception:
+        try:
+            orders = trading_client.get_orders(filter=QueryOrderStatus.CLOSED, limit=200)
+        except Exception:
+            LOG.warning("Could not fetch closed orders from Alpaca; loss-streak sync skipped for this cycle.")
+            return []
+
+    return [o for o in orders if getattr(o, "symbol", None) == symbol]
+
+
+def extract_completed_trade_outcomes(closed_orders):
+    entries = []
+    exits = []
+
+    for order in closed_orders:
+        oid = str(_safe_attr(order, "id", default="") or "")
+        side = _normalize_side(_safe_attr(order, "side", default=""))
+        status = str(_safe_attr(order, "status", default="") or "").lower()
+        client_order_id = str(_safe_attr(order, "client_order_id", default="") or "")
+        filled_avg_price = _to_float(_safe_attr(order, "filled_avg_price", "filled_avg", default=None))
+        submitted_at = str(_safe_attr(order, "submitted_at", "created_at", "filled_at", default="") or "")
+        order_class = str(_safe_attr(order, "order_class", default="") or "").lower()
+        parent_order_id = str(_safe_attr(order, "parent_order_id", default="") or "")
+
+        if status not in {"filled"}:
+            continue
+
+        rec = {
+            "id": oid,
+            "side": side,
+            "filled_avg_price": filled_avg_price,
+            "submitted_at": submitted_at,
+            "client_order_id": client_order_id,
+            "order_class": order_class,
+            "parent_order_id": parent_order_id,
+        }
+
+        if order_class == "bracket" or client_order_id.startswith("qlb-"):
+            entries.append(rec)
+        elif parent_order_id:
+            exits.append(rec)
+
+    exits_by_parent = {}
+    for ex in exits:
+        exits_by_parent.setdefault(ex["parent_order_id"], []).append(ex)
+
+    completed = []
+    for entry in entries:
+        matches = exits_by_parent.get(entry["id"], [])
+        if not matches:
+            continue
+        entry_price = entry["filled_avg_price"]
+        if entry_price is None:
+            continue
+
+        exit_order = sorted(matches, key=lambda x: x["submitted_at"])[-1]
+        exit_price = exit_order["filled_avg_price"]
+        if exit_price is None:
+            continue
+
+        if entry["side"] == "buy":
+            pnl = exit_price - entry_price
+            won = pnl > 0
+            direction = "long"
+        elif entry["side"] == "sell":
+            pnl = entry_price - exit_price
+            won = pnl > 0
+            direction = "short"
+        else:
+            continue
+
+        completed.append(
+            {
+                "entry_order_id": entry["id"],
+                "entry_client_order_id": entry["client_order_id"],
+                "direction": direction,
+                "entry_price": entry_price,
+                "exit_price": exit_price,
+                "won": won,
+                "pnl_per_share": pnl,
+                "submitted_at": entry["submitted_at"],
+            }
+        )
+
+    completed.sort(key=lambda x: x["submitted_at"])
+    return completed
+
+
+def update_loss_streak_from_broker(trading_client, symbol: str, state: dict) -> dict:
+    closed_orders = get_recent_closed_orders(trading_client, symbol)
+    completed = extract_completed_trade_outcomes(closed_orders)
+
+    if not completed:
+        return state
+
+    latest = completed[-1]
+    latest_key = latest["entry_order_id"] or latest["entry_client_order_id"]
+    if not latest_key:
+        return state
+
+    if state.get("last_loss_order_id") == latest_key:
+        return state
+
+    streak = 0
+    for trade in reversed(completed):
+        if trade["won"]:
+            break
+        streak += 1
+
+    state["loss_streak"] = streak
+    state["last_loss_order_id"] = latest_key
+    return state
 
 
 def signal_to_order(latest_complete_df: pd.DataFrame, config: StrategyConfig):
@@ -205,9 +399,32 @@ def execute_once() -> int:
     config = final_config()
     trading_client, data_client = get_clients()
     log_path = os.getenv("BOT_LOG_PATH", "paper_trades.csv")
+    max_consecutive_losses = int(os.getenv("BOT_MAX_CONSECUTIVE_LOSSES", "3"))
+    max_trades_per_day = int(os.getenv("BOT_MAX_TRADES_PER_DAY", "1"))
+
+    state = load_state()
+    state = reset_daily_counters_if_needed(state)
+    state = update_loss_streak_from_broker(trading_client, config.symbol, state)
+    save_state(state)
 
     if not in_regular_session():
         LOG.info("Outside regular US session. No action taken.")
+        return 0
+
+    if state.get("loss_streak", 0) >= max_consecutive_losses:
+        LOG.warning(
+            "Loss streak lock active for %s: %s consecutive losses. No new order sent.",
+            config.symbol,
+            state.get("loss_streak", 0),
+        )
+        return 0
+
+    if state.get("trades_today", 0) >= max_trades_per_day:
+        LOG.info(
+            "Daily trade cap reached for %s: %s trades today. No new order sent.",
+            config.symbol,
+            state.get("trades_today", 0),
+        )
         return 0
 
     open_position = get_open_position(trading_client, config.symbol)
@@ -245,6 +462,10 @@ def execute_once() -> int:
     )
 
     order = trading_client.submit_order(req)
+
+    state["trades_today"] = int(state.get("trades_today", 0)) + 1
+    state["last_trade_day"] = today_key()
+    save_state(state)
 
     log_row = {
         "logged_at": datetime.now(timezone.utc).isoformat(),
