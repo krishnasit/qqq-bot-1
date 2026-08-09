@@ -94,6 +94,11 @@ def get_clients():
     return trading, market_data
 
 
+def get_account_equity(trading_client) -> float:
+    account = trading_client.get_account()
+    return float(account.equity)
+
+
 def in_regular_session() -> bool:
     now = datetime.now(timezone.utc)
     minutes = now.hour * 60 + now.minute
@@ -450,9 +455,31 @@ def execute_once() -> int:
         LOG.info("No valid signal on the latest completed candle.")
         return 0
 
+    risk_per_share = abs(order_signal["entry_reference"] - order_signal["stop"])
+    if risk_per_share <= 0:
+        LOG.warning("Invalid risk_per_share (%s). Skipping order.", risk_per_share)
+        return 0
+
+    risk_pct = float(os.getenv("BOT_RISK_PCT", "0.01"))
+    equity = get_account_equity(trading_client)
+    risk_amount = equity * risk_pct
+    qty = int(risk_amount // risk_per_share)
+
+    if qty < 1:
+        LOG.warning(
+            "Computed qty < 1 (equity=%.2f, risk_pct=%.4f, risk_per_share=%.4f). Skipping order.",
+            equity, risk_pct, risk_per_share,
+        )
+        return 0
+
+    LOG.info(
+        "Position sizing: equity=%.2f risk_pct=%.4f risk_amount=%.2f risk_per_share=%.4f qty=%s",
+        equity, risk_pct, risk_amount, risk_per_share, qty,
+    )
+
     req = MarketOrderRequest(
         symbol=config.symbol,
-        qty=float(os.getenv("BOT_QTY", "1")),
+        qty=qty,
         side=order_signal["side"],
         time_in_force=TimeInForce.DAY,
         order_class=OrderClass.BRACKET,
