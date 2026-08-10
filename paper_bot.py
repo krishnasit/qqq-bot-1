@@ -24,8 +24,29 @@ from backtester import near_ema, prepare_strategy_frame
 from config import StrategyConfig
 from patterns import detect_pattern
 
+import sys
+import structlog
+
 load_dotenv()
-LOG = logging.getLogger("paper_bot")
+
+logging.basicConfig(
+    format="%(message)s",
+    stream=sys.stdout,
+    level=logging.INFO,
+)
+
+structlog.configure(
+    processors=[
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso", utc=True),
+        structlog.processors.EventRenamer("message"),
+        structlog.processors.JSONRenderer(),
+    ],
+    wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
+    cache_logger_on_first_use=True,
+)
+
+LOG = structlog.get_logger("paper_bot")
 
 
 def final_config() -> StrategyConfig:
@@ -518,7 +539,6 @@ def main():
     parser.add_argument("--loop", action="store_true", help="Run continuously")
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
     if args.once == args.loop:
         parser.error("Choose exactly one of --once or --loop")
