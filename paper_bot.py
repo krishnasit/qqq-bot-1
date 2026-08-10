@@ -38,6 +38,7 @@ logging.basicConfig(
 structlog.configure(
     processors=[
         structlog.processors.add_log_level,
+        structlog.stdlib.PositionalArgumentsFormatter(),
         structlog.processors.TimeStamper(fmt="iso", utc=True),
         structlog.processors.EventRenamer("message"),
         structlog.processors.JSONRenderer(),
