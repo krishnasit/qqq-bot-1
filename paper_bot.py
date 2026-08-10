@@ -134,10 +134,9 @@ def fetch_recent_bars(data_client, symbol: str, lookback_days: int = 10, limit: 
 
 
 def get_open_orders(trading_client, symbol: str):
-    try:
-        orders = trading_client.get_orders(filter=QueryOrderStatus.OPEN, limit=100)
-    except TypeError:
-        orders = trading_client.get_orders(status="open", limit=100)
+    from alpaca.trading.requests import GetOrdersRequest
+    request = GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=100)
+    orders = trading_client.get_orders(filter=request)
     return [o for o in orders if getattr(o, "symbol", None) == symbol]
 
 
