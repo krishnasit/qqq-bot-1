@@ -201,7 +201,7 @@ def get_recent_closed_orders(trading_client, symbol: str, days_back: int = 5):
         orders = trading_client.get_orders(filter=req)
     except Exception:
         try:
-            orders = trading_client.get_orders(filter=QueryOrderStatus.CLOSED, limit=200)
+            orders = trading_client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=200))
         except Exception:
             LOG.warning("Could not fetch closed orders from Alpaca; loss-streak sync skipped for this cycle.")
             return []
