@@ -484,7 +484,17 @@ def execute_once() -> int:
     risk_pct = float(os.getenv("BOT_RISK_PCT", "0.01"))
     equity = get_account_equity(trading_client)
     risk_amount = equity * risk_pct
-    qty = int(risk_amount // risk_per_share)
+    MIN_RISK_PER_SHARE = 0.50  # floor to stop runaway qty from tiny ATR stops
+    MAX_CAPITAL_PCT = 0.20      # never deploy more than 20% of equity on one trade
+    safe_risk_per_share = max(risk_per_share, MIN_RISK_PER_SHARE)
+    qty_by_risk = int(risk_amount // safe_risk_per_share)
+    qty_by_capital = int((equity * MAX_CAPITAL_PCT) // order_signal["entry_reference"])
+    qty = max(0, min(qty_by_risk, qty_by_capital))
+    LOG.info(
+        "Position sizing: equity=%.2f risk_pct=%.4f risk_amount=%.2f risk_per_share=%.4f "
+        "qty_by_risk=%s qty_by_capital=%s qty_final=%s",
+        equity, risk_pct, risk_amount, risk_per_share, qty_by_risk, qty_by_capital, qty,
+    )
 
     if qty < 1:
         LOG.warning(
