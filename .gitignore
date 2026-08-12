@@ -11,3 +11,4 @@ logger.py
 .env
 .venv/
 paper_bot_state.json
+*.code-workspace
