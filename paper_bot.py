@@ -426,7 +426,7 @@ def execute_once() -> int:
     trading_client, data_client = get_clients()
     log_path = os.getenv("BOT_LOG_PATH", "paper_trades.csv")
     max_consecutive_losses = int(os.getenv("BOT_MAX_CONSECUTIVE_LOSSES", "3"))
-    max_trades_per_day = int(os.getenv("BOT_MAX_TRADES_PER_DAY", "1"))
+    max_trades_per_day = int(os.getenv("BOT_MAX_TRADES_PER_DAY", "5"))
 
     state = load_state()
     state = reset_daily_counters_if_needed(state)
