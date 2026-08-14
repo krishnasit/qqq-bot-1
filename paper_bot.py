@@ -172,6 +172,72 @@ def get_open_position(trading_client, symbol: str):
         raise
 
 
+def flatten_symbol(trading_client, symbol: str):
+    """Emergency flatten: cancel all open orders for symbol, then market-close any residual position."""
+    try:
+        open_orders = get_open_orders(trading_client, symbol)
+        for o in open_orders:
+            try:
+                trading_client.cancel_order_by_id(o.id)
+                LOG.warning("Cancelled stray order during flatten: %s", o.id)
+            except Exception as e:
+                LOG.error("Failed to cancel order %s during flatten: %s", o.id, e)
+    except Exception as e:
+        LOG.error("Could not list open orders during flatten: %s", e)
+
+    try:
+        pos = get_open_position(trading_client, symbol)
+        if pos is not None:
+            qty = abs(int(float(pos.qty)))
+            side = OrderSide.SELL if float(pos.qty) > 0 else OrderSide.BUY
+            if qty > 0:
+                trading_client.submit_order(MarketOrderRequest(
+                    symbol=symbol, qty=qty, side=side, time_in_force=TimeInForce.DAY,
+                ))
+                LOG.warning("FLATTEN: Residual %s position closed (%s shares).", symbol, qty)
+    except Exception as e:
+        LOG.error("Could not flatten residual position: %s", e)
+
+
+def verify_flat_or_fix(trading_client, symbol: str) -> bool:
+    """Return True if flat. If not flat but no resting orders exist to close it, force-flatten."""
+    try:
+        pos = get_open_position(trading_client, symbol)
+        orders = get_open_orders(trading_client, symbol)
+    except Exception as e:
+        LOG.error("verify_flat_or_fix: could not check broker state: %s", e)
+        return True
+
+    if pos is None:
+        return True
+
+    if not orders:
+        LOG.warning(
+            "Residual %s position with NO resting orders (orphaned bracket). Force-flattening.",
+            symbol,
+        )
+        flatten_symbol(trading_client, symbol)
+        return True
+
+    return False
+
+
+def eod_sweep(trading_client, symbol: str) -> bool:
+    """Flatten everything 5 min before regular session close (20:00 UTC). Returns True if it acted."""
+    now = datetime.now(timezone.utc)
+    minutes = now.hour * 60 + now.minute
+    eod_trigger = (19 * 60 + 55)
+    eod_hard_close = (20 * 60)
+    if eod_trigger <= minutes < eod_hard_close:
+        pos = get_open_position(trading_client, symbol)
+        orders = get_open_orders(trading_client, symbol)
+        if pos is not None or orders:
+            LOG.warning("EOD SWEEP triggered at %s UTC for %s.", now.strftime("%H:%M"), symbol)
+            flatten_symbol(trading_client, symbol)
+            return True
+    return False
+
+
 def _safe_attr(obj, *names, default=None):
     for name in names:
         if hasattr(obj, name):
@@ -421,21 +487,44 @@ def append_log(csv_path: str, row: dict):
         writer.writerow({k: row.get(k, "") for k in fields})
 
 
+_cached_clients: dict = {}
+_last_streak_check: float = 0.0
+
 def execute_once() -> int:
+    global _cached_clients, _last_streak_check
     config = final_config()
-    trading_client, data_client = get_clients()
+
+    # Cache clients across cycles — avoid reconnecting every poll
+    if not _cached_clients:
+        trading_client, data_client = get_clients()
+        _cached_clients["trading"] = trading_client
+        _cached_clients["data"] = data_client
+    trading_client = _cached_clients["trading"]
+    data_client = _cached_clients["data"]
+
     log_path = os.getenv("BOT_LOG_PATH", "paper_trades.csv")
     max_consecutive_losses = int(os.getenv("BOT_MAX_CONSECUTIVE_LOSSES", "3"))
     max_trades_per_day = int(os.getenv("BOT_MAX_TRADES_PER_DAY", "5"))
 
     state = load_state()
     state = reset_daily_counters_if_needed(state)
-    state = update_loss_streak_from_broker(trading_client, config.symbol, state)
-    save_state(state)
+
+    # Only refresh loss streak from broker every 5 minutes — not every 5-second poll
+    now_ts = time.time()
+    if now_ts - _last_streak_check >= 300:
+        state = update_loss_streak_from_broker(trading_client, config.symbol, state)
+        _last_streak_check = now_ts
+        save_state(state)
+
+    if eod_sweep(trading_client, config.symbol):
+        return 0
 
     if not in_regular_session():
         LOG.info("Outside regular US session. No action taken.")
         return 0
+
+    if not verify_flat_or_fix(trading_client, config.symbol):
+        pass  # legitimately in an open bracket trade, handled by existing position/order checks below
 
     if state.get("loss_streak", 0) >= max_consecutive_losses:
         LOG.warning(
@@ -519,10 +608,22 @@ def execute_once() -> int:
         )
         return 0
 
-    LOG.info(
-        "Position sizing: equity=%.2f risk_pct=%.4f risk_amount=%.2f risk_per_share=%.4f qty=%s",
-        equity, risk_pct, risk_amount, risk_per_share, qty,
-    )
+    entry_ref = order_signal["entry_reference"]
+    stop_px = order_signal["stop"]
+    target_px = order_signal["target"]
+    is_long = order_signal["side"] == OrderSide.BUY
+    if is_long and not (stop_px < entry_ref < target_px):
+        LOG.warning(
+            "Invalid long bracket geometry (stop=%.4f entry=%.4f target=%.4f). Skipping order.",
+            stop_px, entry_ref, target_px,
+        )
+        return 0
+    if not is_long and not (target_px < entry_ref < stop_px):
+        LOG.warning(
+            "Invalid short bracket geometry (stop=%.4f entry=%.4f target=%.4f). Skipping order.",
+            stop_px, entry_ref, target_px,
+        )
+        return 0
 
     req = MarketOrderRequest(
         symbol=config.symbol,
@@ -535,7 +636,26 @@ def execute_once() -> int:
         client_order_id=order_signal["client_order_id"],
     )
 
-    order = trading_client.submit_order(req)
+    order = None
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            order = trading_client.submit_order(req)
+            break
+        except Exception as e:
+            LOG.error(
+                "Bracket order submit failed (attempt %s/%s) for %s: %s: %s",
+                attempt, max_attempts, order_signal["client_order_id"], type(e).__name__, e,
+            )
+            if attempt == max_attempts:
+                LOG.error(
+                    "Giving up on order after %s attempts. client_order_id=%s side=%s qty=%s "
+                    "entry=%.4f stop=%.4f target=%.4f",
+                    max_attempts, order_signal["client_order_id"], order_signal["side_label"],
+                    qty, entry_ref, stop_px, target_px,
+                )
+                return 0
+            time.sleep(min(8, 2 ** attempt))
 
     state["trades_today"] = int(state.get("trades_today", 0)) + 1
     state["last_trade_day"] = today_key()
