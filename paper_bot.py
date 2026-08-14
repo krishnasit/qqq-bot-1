@@ -453,8 +453,17 @@ def execute_once() -> int:
         )
         return 0
 
-    open_position = get_open_position(trading_client, config.symbol)
-    open_orders = get_open_orders(trading_client, config.symbol)
+    try:
+        open_position = get_open_position(trading_client, config.symbol)
+    except Exception as e:
+        LOG.error("Could not check open position, skipping cycle for safety.", error=str(e))
+        return 0
+
+    try:
+        open_orders = get_open_orders(trading_client, config.symbol)
+    except Exception as e:
+        LOG.error("Could not check open orders, skipping cycle for safety.", error=str(e))
+        return 0
 
     if open_position is not None:
         LOG.info("Existing open position detected for %s. No new order sent.", config.symbol)
@@ -470,6 +479,13 @@ def execute_once() -> int:
         return 0
 
     latest_complete = bars.iloc[:-1].copy()
+
+    # Dedup: skip if we already acted on this exact candle
+    last_candle_key = latest_complete.index[-1].isoformat()
+    if state.get("last_signal_candle_acted") == last_candle_key:
+        LOG.info("Signal candle %s already acted on. Skipping.", last_candle_key)
+        return 0
+
     order_signal = signal_to_order(latest_complete, config)
 
     if order_signal is None:
@@ -523,6 +539,7 @@ def execute_once() -> int:
 
     state["trades_today"] = int(state.get("trades_today", 0)) + 1
     state["last_trade_day"] = today_key()
+    state["last_signal_candle_acted"] = order_signal["signal_timestamp"].isoformat()
     save_state(state)
 
     log_row = {
