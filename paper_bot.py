@@ -575,13 +575,23 @@ def main():
         execute_once()
         return
 
-    poll_seconds = max(30, int(os.getenv("BOT_POLL_SECONDS", "60")))
+    poll_seconds = max(10, int(os.getenv("BOT_POLL_SECONDS", "60")))
     while True:
         try:
             execute_once()
         except Exception:
             LOG.exception("Paper bot cycle failed.")
-        time.sleep(poll_seconds)
+
+        # Sleep smartly: wake up fast near 5-min candle closes (:00,:05,:10...),
+        # otherwise sleep longer to avoid hammering the API
+        now = datetime.now(timezone.utc)
+        secs = now.second + (now.minute % 5) * 60  # seconds into current 5-min window
+        time_to_close = 300 - secs                  # seconds until next 5-min candle closes
+        if time_to_close <= 30:
+            sleep_for = 5   # near close: check every 5 seconds
+        else:
+            sleep_for = min(poll_seconds, time_to_close - 25)  # sleep until 25s before close
+        time.sleep(sleep_for)
 
 
 if __name__ == "__main__":
