@@ -448,13 +448,21 @@ def signal_to_order(latest_complete_df: pd.DataFrame, config: StrategyConfig):
     entry = float(row["close"])
     atr_buffer = float(row["atr"]) * float(config.atr_stop_buffer_mult)
 
+    # Safety floor: Alpaca rejects bracket orders when stop_price is too close
+    # to base_price (min tick distance). Enforce a minimum buffer of either
+    # $0.05 or 0.05% of entry price, whichever is larger, on top of the ATR
+    # buffer. This only ever widens the stop on abnormally low-ATR candles;
+    # it never tightens or otherwise alters the strategy's normal stops.
+    min_buffer = max(0.05, entry * 0.0005)
+    effective_buffer = max(atr_buffer, min_buffer)
+
     if bias == "long":
-        stop = float(row["low"]) - atr_buffer
+        stop = float(row["low"]) - effective_buffer
         target = entry + (entry - stop) * float(config.rr_target)
         side = OrderSide.BUY
         side_label = "long"
     else:
-        stop = float(row["high"]) + atr_buffer
+        stop = float(row["high"]) + effective_buffer
         target = entry - (stop - entry) * float(config.rr_target)
         side = OrderSide.SELL
         side_label = "short"
