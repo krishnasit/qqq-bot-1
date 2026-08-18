@@ -625,6 +625,19 @@ def execute_once() -> int:
         )
         return 0
 
+    # Live price guard: skip if market has moved stop invalid
+    try:
+        latest_quote = data_client.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=config.symbol))
+        live_bid = float(latest_quote[config.symbol].bid_price or latest_quote[config.symbol].ask_price)
+        if is_long and stop_px >= live_bid - 0.02:
+            LOG.warning("Skipping order: stop_px=%.4f >= live_bid=%.4f - 0.02. Price moved against entry.", stop_px, live_bid)
+            return 0
+        if not is_long and stop_px <= live_bid + 0.02:
+            LOG.warning("Skipping order: stop_px=%.4f <= live_bid=%.4f + 0.02. Price moved against entry.", stop_px, live_bid)
+            return 0
+    except Exception as e:
+        LOG.warning("Could not fetch live quote for guard check: %s", e)
+
     req = MarketOrderRequest(
         symbol=config.symbol,
         qty=qty,
