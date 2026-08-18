@@ -66,7 +66,7 @@ def final_config() -> StrategyConfig:
         rr_target=2.5,
         trailing_stop_enabled=False,
         trailing_atr_mult=1.0,
-        enabled_patterns=["engulfing"],
+        enabled_patterns=["engulfing", "pin_bar", "liquidity_sweep"],
         initial_capital=10000.0,
     )
 
