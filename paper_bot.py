@@ -648,9 +648,7 @@ def execute_once() -> int:
         live_bid = float(latest_quote[config.symbol].bid_price or latest_quote[config.symbol].ask_price)
         if is_long and stop_px >= live_bid - 0.02:
             LOG.warning("Skipping order: stop_px=%.4f >= live_bid=%.4f - 0.02. Price moved against entry.", stop_px, live_bid)
-            send_telegram(f"🚫 <b>QQQ Order Skipped</b>
-Live price moved — stop too close
-Stop: {stop_px:.2f} | Bid: {live_bid:.2f}")
+            send_telegram("🚫 QQQ Order Skipped\nLive price moved - stop too close\nStop: " + f"{stop_px:.2f}" + " | Bid: " + f"{live_bid:.2f}")
             return 0
         if not is_long and stop_px <= live_bid + 0.02:
             LOG.warning("Skipping order: stop_px=%.4f <= live_bid=%.4f + 0.02. Price moved against entry.", stop_px, live_bid)
@@ -687,10 +685,7 @@ Stop: {stop_px:.2f} | Bid: {live_bid:.2f}")
                     max_attempts, order_signal["client_order_id"], order_signal["side_label"],
                     qty, entry_ref, stop_px, target_px,
                 )
-                send_telegram(f"❌ <b>QQQ Order FAILED</b>
-Gave up after {max_attempts} attempts
-Side: {order_signal['side_label']}
-Entry: {entry_ref:.2f} Stop: {stop_px:.2f} Target: {target_px:.2f}")
+                send_telegram("❌ QQQ Order FAILED\nGave up after " + str(max_attempts) + " attempts\nSide: " + order_signal['side_label'] + "\nEntry: " + f"{entry_ref:.2f}" + " Stop: " + f"{stop_px:.2f}" + " Target: " + f"{target_px:.2f}")
                 return 0
             time.sleep(min(8, 2 ** attempt))
 
@@ -716,21 +711,14 @@ Entry: {entry_ref:.2f} Stop: {stop_px:.2f} Target: {target_px:.2f}")
     append_log(log_path, log_row)
     LOG.warning("PAPER ORDER SUBMITTED: %s", log_row)
     send_telegram(
-        f"🚀 <b>QQQ Signal Detected</b>
-"
-        f"Pattern: {order_signal['pattern']}
-"
-        f"Side: {order_signal['side_label'].upper()}
-"
-        f"Entry: {order_signal['entry_reference']:.2f}
-"
-        f"Stop: {order_signal['stop']:.2f}
-"
-        f"Target: {order_signal['target']:.2f}
-"
-        f"Qty: {qty}
-"
-        f"R:R 1:{config.rr_target}"
+        "🚀 QQQ Signal Detected\n"
+        + "Pattern: " + str(order_signal['pattern']) + "\n"
+        + "Side: " + str(order_signal['side_label']).upper() + "\n"
+        + "Entry: " + f"{order_signal['entry_reference']:.2f}" + "\n"
+        + "Stop: " + f"{order_signal['stop']:.2f}" + "\n"
+        + "Target: " + f"{order_signal['target']:.2f}" + "\n"
+        + "Qty: " + str(qty) + "\n"
+        + "R:R 1:" + str(config.rr_target)
     )
     return 1
 
