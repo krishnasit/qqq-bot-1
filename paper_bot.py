@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import time
+import requests as _requests
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -48,6 +49,22 @@ structlog.configure(
 )
 
 LOG = structlog.get_logger("paper_bot")
+
+
+def send_telegram(msg: str) -> None:
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+    if not token or not chat_id:
+        return
+    try:
+        _requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"},
+            timeout=5,
+        )
+    except Exception as e:
+        LOG.warning("Telegram notify failed: %s", e)
+
 
 
 def final_config() -> StrategyConfig:
@@ -631,6 +648,9 @@ def execute_once() -> int:
         live_bid = float(latest_quote[config.symbol].bid_price or latest_quote[config.symbol].ask_price)
         if is_long and stop_px >= live_bid - 0.02:
             LOG.warning("Skipping order: stop_px=%.4f >= live_bid=%.4f - 0.02. Price moved against entry.", stop_px, live_bid)
+            send_telegram(f"🚫 <b>QQQ Order Skipped</b>
+Live price moved — stop too close
+Stop: {stop_px:.2f} | Bid: {live_bid:.2f}")
             return 0
         if not is_long and stop_px <= live_bid + 0.02:
             LOG.warning("Skipping order: stop_px=%.4f <= live_bid=%.4f + 0.02. Price moved against entry.", stop_px, live_bid)
@@ -667,6 +687,10 @@ def execute_once() -> int:
                     max_attempts, order_signal["client_order_id"], order_signal["side_label"],
                     qty, entry_ref, stop_px, target_px,
                 )
+                send_telegram(f"❌ <b>QQQ Order FAILED</b>
+Gave up after {max_attempts} attempts
+Side: {order_signal['side_label']}
+Entry: {entry_ref:.2f} Stop: {stop_px:.2f} Target: {target_px:.2f}")
                 return 0
             time.sleep(min(8, 2 ** attempt))
 
@@ -691,6 +715,23 @@ def execute_once() -> int:
     }
     append_log(log_path, log_row)
     LOG.warning("PAPER ORDER SUBMITTED: %s", log_row)
+    send_telegram(
+        f"🚀 <b>QQQ Signal Detected</b>
+"
+        f"Pattern: {order_signal['pattern']}
+"
+        f"Side: {order_signal['side_label'].upper()}
+"
+        f"Entry: {order_signal['entry_reference']:.2f}
+"
+        f"Stop: {order_signal['stop']:.2f}
+"
+        f"Target: {order_signal['target']:.2f}
+"
+        f"Qty: {qty}
+"
+        f"R:R 1:{config.rr_target}"
+    )
     return 1
 
 
