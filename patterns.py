@@ -91,6 +91,29 @@ def detect_pattern(df: pd.DataFrame, i: int, bias: str, enabled_patterns) -> str
     enabled = {str(p).lower() for p in (enabled_patterns or [])}
     idx = df.index[i]
 
+    # 1. Structural Liquidity Sweep (PDL/PDH)
+    # We check if the current candle swept the previous day's extreme and reclaimed it
+    if "liquidity_sweep" in enabled:
+        pdl = df["prev_day_low"].iloc[i]
+        pdh = df["prev_day_high"].iloc[i]
+
+        if bias == "long":
+            # Swept PDL and closed above it
+            if df["low"].iloc[i] < pdl and df["close"].iloc[i] > pdl:
+                return "liq_sweep_pdl"
+        if bias == "short":
+            # Swept PDH and closed below it
+            if df["high"].iloc[i] > pdh and df["close"].iloc[i] < pdh:
+                return "liq_sweep_pdh"
+
+    # 2. RSI Divergence (The Momentum Shift)
+    if "rsi_div" in enabled:
+        if bias == "long" and bool(detect_bullish_divergence(df, i)):
+            return "rsi_bull_div"
+        if bias == "short" and bool(detect_bearish_divergence(df, i)):
+            return "rsi_bear_div"
+
+    # 3. Candlestick Confirmation
     if "engulfing" in enabled:
         if bias == "long" and bool(bullish_engulfing(df).loc[idx]):
             return "engulfing"
@@ -103,22 +126,23 @@ def detect_pattern(df: pd.DataFrame, i: int, bias: str, enabled_patterns) -> str
         if bias == "short" and bool(bearish_pin_bar(df, 2.0).loc[idx]):
             return "pin_bar"
 
-    if "inside_bar" in enabled:
-        if bias == "long" and bool(inside_bar_break_bullish(df).loc[idx]):
-            return "inside_bar"
-        if bias == "short" and bool(inside_bar_break_bearish(df).loc[idx]):
-            return "inside_bar"
-
-    if "wick_rejection" in enabled:
-        if bias == "long" and bool(wick_rejection_bullish(df, 2.0).loc[idx]):
-            return "wick_rejection"
-        if bias == "short" and bool(wick_rejection_bearish(df, 2.0).loc[idx]):
-            return "wick_rejection"
-
-    if "liquidity_sweep" in enabled:
-        if bias == "long" and bool(liquidity_sweep_bullish(df).loc[idx]):
-            return "liquidity_sweep"
-        if bias == "short" and bool(liquidity_sweep_bearish(df).loc[idx]):
-            return "liquidity_sweep"
-
     return None
+
+def detect_bullish_divergence(df: pd.DataFrame, i: int) -> bool:
+    if i < 20: return False
+    # Price: Lower Low, RSI: Higher Low
+    price_low = df["low"].iloc[i]
+    prev_low = df["low"].iloc[i-10:i].min()
+    rsi_now = df["rsi"].iloc[i]
+    rsi_prev = df["rsi"].iloc[i-10:i].min()
+    return (price_low < prev_low) and (rsi_now > rsi_prev)
+
+def detect_bearish_divergence(df: pd.DataFrame, i: int) -> bool:
+    if i < 20: return False
+    # Price: Higher High, RSI: Lower High
+    price_high = df["high"].iloc[i]
+    prev_high = df["high"].iloc[i-10:i].max()
+    rsi_now = df["rsi"].iloc[i]
+    rsi_prev = df["rsi"].iloc[i-10:i].max()
+    return (price_high > prev_high) and (rsi_now < rsi_prev)
+

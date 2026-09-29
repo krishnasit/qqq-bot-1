@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pandas as pd
+import numpy as np
 
 
 def near_ema(row, ema_confluence_pct: float) -> bool:
@@ -30,19 +31,38 @@ def _compute_after_buffer(index: pd.DatetimeIndex, london_timezone: str, start_h
 def prepare_strategy_frame(df: pd.DataFrame, config) -> pd.DataFrame:
     out = df.copy().sort_index()
 
+    # 1. HTF Bias (Using a 1-hour approximation from 5m bars)
+    # 1h Trend = Price > SMA(20) of 1h Close
+    resampled_1h = out["close"].resample('h').last()
+    sma_1h = resampled_1h.rolling(20).mean()
+    bias_1h = (resampled_1h > sma_1h).astype(int)
+    # Map 1h bias back to 5m index
+    out["htf_bias_raw"] = bias_1h.reindex(out.index, method='ffill')
+    out["bias"] = out["htf_bias_raw"].apply(lambda x: "long" if x == 1 else "short")
+
+    # 2. Daily Levels for Structural Sweeps
+    # Get daily high/low and shift by 1 to get "Previous Day"
+    daily = out["close"].resample('D').ohlc()
+    out["prev_day_high"] = daily["high"].shift(1).reindex(out.index, method='ffill')
+    out["prev_day_low"] = daily["low"].shift(1).reindex(out.index, method='ffill')
+
+    # 3. Momentum Indicator (RSI)
+    delta = out["close"].diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    rs = gain / loss.replace(0, np.nan)
+    out["rsi"] = 100 - (100 / (1 + rs))
+
+    # 4. Existing logic for EMA and ATR
     out["ema"] = out["close"].ewm(span=int(config.entry_ema_length), adjust=False).mean()
     out["trend_sma"] = out["close"].rolling(int(config.trend_sma_length), min_periods=int(config.trend_sma_length)).mean()
-    out["bias"] = _compute_bias(out, int(config.trend_sma_length))
 
     prev_close = out["close"].shift(1)
-    tr = pd.concat(
-        [
-            (out["high"] - out["low"]).abs(),
-            (out["high"] - prev_close).abs(),
-            (out["low"] - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
+    tr = pd.concat([
+        (out["high"] - out["low"]).abs(),
+        (out["high"] - prev_close).abs(),
+        (out["low"] - prev_close).abs(),
+    ], axis=1).max(axis=1)
     out["atr"] = tr.rolling(int(config.atr_length), min_periods=int(config.atr_length)).mean()
 
     out["swing_low"] = out["low"].rolling(10, min_periods=10).min()

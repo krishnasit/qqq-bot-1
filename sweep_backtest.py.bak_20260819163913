@@ -1,0 +1,162 @@
+from __future__ import annotations
+import argparse, itertools, os
+from datetime import datetime, timedelta, timezone
+import pandas as pd
+from dotenv import load_dotenv
+from alpaca.data.enums import DataFeed
+from alpaca.data.historical.stock import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+from backtester import prepare_strategy_frame, near_ema
+from config import StrategyConfig
+from patterns import detect_pattern
+
+load_dotenv()
+
+PARAM_GRID = {
+    "entry_ema_length":        [20, 50, 100],
+    "trend_sma_length":        [100, 200],
+    "ema_confluence_pct":      [0.5, 0.8, 1.2],
+    "atr_length":              [14, 20],
+    "atr_stop_buffer_mult":    [0.1, 0.25, 0.5],
+    "rr_target":               [1.5, 2.0, 2.5],
+    "no_trade_buffer_minutes": [60, 90],
+    "enabled_patterns": [
+        ["engulfing"],
+        ["pin_bar"],
+        ["engulfing", "pin_bar"],
+        ["engulfing", "pin_bar", "wick_rejection"],
+        ["engulfing", "pin_bar", "inside_bar"],
+        ["engulfing", "pin_bar", "liquidity_sweep"],
+    ],
+}
+
+def fetch_bars(symbol, days):
+    api_key = os.getenv("ALPACA_API_KEY")
+    api_secret = os.getenv("ALPACA_SECRET_KEY")
+    if not api_key or not api_secret:
+        raise RuntimeError("Missing ALPACA_API_KEY / ALPACA_SECRET_KEY in .env")
+    client = StockHistoricalDataClient(api_key, api_secret)
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days)
+    req = StockBarsRequest(symbol_or_symbols=symbol, timeframe=TimeFrame(5, TimeFrameUnit.Minute), start=start, end=end, feed=DataFeed.IEX)
+    bars = client.get_stock_bars(req).df
+    if bars.empty:
+        return bars
+    if isinstance(bars.index, pd.MultiIndex):
+        bars = bars.xs(symbol, level=0)
+    bars.index = pd.to_datetime(bars.index, utc=True)
+    return bars[["open", "high", "low", "close", "volume"]].sort_index()
+
+def run_backtest(df, config, record_trades=False):
+    sf = prepare_strategy_frame(df, config)
+    capital = float(config.initial_capital)
+    equity, peak, max_dd_pct = capital, capital, 0.0
+    trades, in_position = [], False
+    entry_price = stop_price = target_price = entry_time = side = None
+    for i in range(max(config.trend_sma_length, config.atr_length, 15), len(sf)):
+        row = sf.iloc[i]
+        if in_position:
+            high, low = float(row["high"]), float(row["low"])
+            exit_price = result = None
+            if side == "long":
+                if low <= stop_price: exit_price, result = stop_price, "LOSS"
+                elif high >= target_price: exit_price, result = target_price, "WIN"
+            else:
+                if high >= stop_price: exit_price, result = stop_price, "LOSS"
+                elif low <= target_price: exit_price, result = target_price, "WIN"
+            if exit_price is not None:
+                rpu = abs(entry_price - stop_price)
+                rm = (exit_price - entry_price) / rpu if side == "long" else (entry_price - exit_price) / rpu
+                pnl = rm * equity * 0.01
+                equity += pnl
+                peak = max(peak, equity)
+                dd = (peak - equity) / peak * 100.0 if peak > 0 else 0.0
+                max_dd_pct = max(max_dd_pct, dd)
+                if record_trades:
+                    trades.append({"entry_time": entry_time, "exit_time": sf.index[i], "side": side, "entry_price": round(entry_price,4), "exit_price": round(exit_price,4), "stop_price": round(stop_price,4), "target_price": round(target_price,4), "r_multiple": round(rm,3), "pnl_usd": round(pnl,2), "result": result, "equity": round(equity,2), "drawdown_pct": round(dd,2)})
+                else:
+                    trades.append({"result": result, "r": rm, "pnl": pnl})
+                in_position = False
+            continue
+        if not bool(row.get("after_buffer", False)): continue
+        bias = row.get("bias")
+        if bias not in ("long", "short"): continue
+        if not near_ema(row, config.ema_confluence_pct): continue
+        if pd.isna(row.get("atr")): continue
+        pattern = detect_pattern(sf, i, bias, config.enabled_patterns)
+        if not pattern: continue
+        entry_price = float(row["close"])
+        atr = float(row["atr"])
+        sd = atr * (1.0 + config.atr_stop_buffer_mult)
+        if bias == "long":
+            stop_price = entry_price - sd; target_price = entry_price + sd * config.rr_target; side = "long"
+        else:
+            stop_price = entry_price + sd; target_price = entry_price - sd * config.rr_target; side = "short"
+        entry_time = sf.index[i]; in_position = True
+    wins = [t for t in trades if t.get("result") in ("WIN","win")]
+    losses = [t for t in trades if t.get("result") in ("LOSS","loss")]
+    total = len(trades)
+    gp = sum(t.get("pnl_usd", t.get("pnl",0)) for t in wins)
+    gl = abs(sum(t.get("pnl_usd", t.get("pnl",0)) for t in losses))
+    pf = gp/gl if gl > 0 else 999.0
+    aw = gp/len(wins) if wins else 0.0
+    al = gl/len(losses) if losses else 0.0
+    np_ = equity - capital
+    return {"total_trades": total, "wins": len(wins), "losses": len(losses), "win_rate_pct": round(len(wins)/total*100 if total else 0,2), "profit_factor": round(pf,3), "avg_rr": round(aw/al if al else 0,3), "total_r": round(sum(t.get("r_multiple",t.get("r",0)) for t in trades),3), "max_dd_pct": round(max_dd_pct,2), "net_pnl": round(np_,2), "return_pct": round(np_/capital*100,2), "final_equity": round(equity,2)}, trades
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--symbol", default="QQQ")
+    parser.add_argument("--days", type=int, default=180)
+    parser.add_argument("--capital", type=float, default=10000.0)
+    parser.add_argument("--top", type=int, default=10)
+    args = parser.parse_args()
+    print(f"Fetching {args.days}d of 5-min bars for {args.symbol}...")
+    df = fetch_bars(args.symbol, args.days)
+    if df.empty:
+        print("No data."); return
+    print(f"Got {len(df)} bars.")
+    keys = list(PARAM_GRID.keys()); values = list(PARAM_GRID.values())
+    combos = list(itertools.product(*values))
+    print(f"Running {len(combos)} combinations...")
+    results = []
+    for idx, combo in enumerate(combos):
+        params = dict(zip(keys, combo))
+        cfg = StrategyConfig(); cfg.symbol = args.symbol; cfg.initial_capital = args.capital
+        for k,v in params.items(): setattr(cfg, k, v)
+        try: stats, _ = run_backtest(df, cfg)
+        except Exception: continue
+        if stats["total_trades"] < 5: continue
+        row = {**params, **stats}; row["enabled_patterns"] = "+".join(params["enabled_patterns"])
+        results.append(row)
+        if (idx+1) % 100 == 0: print(f"  {idx+1}/{len(combos)} done...")
+    if not results:
+        print("No results."); return
+    rdf = pd.DataFrame(results).sort_values(["profit_factor","win_rate_pct","return_pct"], ascending=False)
+    rdf.to_csv("sweep_results.csv", index=False)
+    print(f"Saved {len(rdf)} combos to sweep_results.csv")
+    cols = ["entry_ema_length","trend_sma_length","ema_confluence_pct","atr_stop_buffer_mult","rr_target","enabled_patterns","total_trades","win_rate_pct","profit_factor","avg_rr","max_dd_pct","return_pct","net_pnl"]
+    print(f"\nTOP {args.top} COMBOS"); print("="*130)
+    print(rdf.head(args.top)[cols].to_string(index=False))
+    best = rdf.iloc[0]
+    best_cfg = StrategyConfig(); best_cfg.symbol = args.symbol; best_cfg.initial_capital = args.capital
+    best_cfg.entry_ema_length = int(best["entry_ema_length"]); best_cfg.trend_sma_length = int(best["trend_sma_length"])
+    best_cfg.ema_confluence_pct = float(best["ema_confluence_pct"]); best_cfg.atr_length = int(best["atr_length"])
+    best_cfg.atr_stop_buffer_mult = float(best["atr_stop_buffer_mult"]); best_cfg.rr_target = float(best["rr_target"])
+    best_cfg.no_trade_buffer_minutes = int(best["no_trade_buffer_minutes"]); best_cfg.enabled_patterns = best["enabled_patterns"].split("+")
+    best_stats, trade_log = run_backtest(df, best_cfg, record_trades=True)
+    pd.DataFrame(trade_log).to_csv("trade_log.csv", index=False)
+    print(f"\nSaved {len(trade_log)} trades to trade_log.csv")
+    print(f"\n{'#':<5}{'Entry Time':<22}{'Side':<7}{'Entry':<9}{'Exit':<9}{'Stop':<9}{'Target':<9}{'R':<7}{'PnL':<10}{'Result':<7}{'Equity':<12}{'DD%'}")
+    print("-"*110)
+    for i,t in enumerate(trade_log,1):
+        print(f"{i:<5}{str(t['entry_time'])[:19]:<22}{t['side']:<7}{t['entry_price']:<9}{t['exit_price']:<9}{t['stop_price']:<9}{t['target_price']:<9}{t['r_multiple']:<7}{t['pnl_usd']:<10}{t['result']:<7}{t['equity']:<12}{t['drawdown_pct']}")
+    print(f"\nBEST STATS:")
+    for k,v in best_stats.items(): print(f"  {k:<22}: {v}")
+    print("\nBEST PARAMS:")
+    for c in ["entry_ema_length","trend_sma_length","ema_confluence_pct","atr_length","atr_stop_buffer_mult","rr_target","no_trade_buffer_minutes","enabled_patterns"]:
+        print(f"  {c:<28}: {best[c]}")
+
+if __name__ == "__main__":
+    main()

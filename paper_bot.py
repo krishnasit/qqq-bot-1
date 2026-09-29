@@ -79,11 +79,11 @@ def final_config() -> StrategyConfig:
         entry_ema_length=100,
         ema_confluence_pct=0.8,
         atr_length=20,
-        atr_stop_buffer_mult=0.1,
-        rr_target=2.5,
+        atr_stop_buffer_mult=0.2,
+        rr_target=2.0,
         trailing_stop_enabled=False,
         trailing_atr_mult=1.0,
-        enabled_patterns=["engulfing", "pin_bar", "liquidity_sweep"],
+        enabled_patterns=["liquidity_sweep", "rsi_div", "engulfing", "pin_bar"],
         initial_capital=10000.0,
     )
 
@@ -435,6 +435,7 @@ def signal_to_order(latest_complete_df: pd.DataFrame, config: StrategyConfig):
     if pd.isna(bias) or bias is None:
         return None
 
+    # Structural Logic: Must be near EMA AND have a structural pattern
     if not near_ema(row, config.ema_confluence_pct):
         return None
 
@@ -446,13 +447,10 @@ def signal_to_order(latest_complete_df: pd.DataFrame, config: StrategyConfig):
         return None
 
     entry = float(row["close"])
-    atr_buffer = float(row["atr"]) * float(config.atr_stop_buffer_mult)
+    atr = float(row["atr"])
 
-    # Safety floor: Alpaca rejects bracket orders when stop_price is too close
-    # to base_price (min tick distance). Enforce a minimum buffer of either
-    # $0.05 or 0.05% of entry price, whichever is larger, on top of the ATR
-    # buffer. This only ever widens the stop on abnormally low-ATR candles;
-    # it never tightens or otherwise alters the strategy's normal stops.
+    # Use a buffered stop to avoid "wick-outs"
+    atr_buffer = atr * float(config.atr_stop_buffer_mult)
     min_buffer = max(0.05, entry * 0.0005)
     effective_buffer = max(atr_buffer, min_buffer)
 
@@ -606,6 +604,7 @@ def execute_once() -> int:
         LOG.info("No valid signal on the latest completed candle.")
         return 0
 
+    # Position sizing logic
     risk_per_share = abs(order_signal["entry_reference"] - order_signal["stop"])
     if risk_per_share <= 0:
         LOG.warning("Invalid risk_per_share (%s). Skipping order.", risk_per_share)
@@ -614,12 +613,17 @@ def execute_once() -> int:
     risk_pct = float(os.getenv("BOT_RISK_PCT", "0.01"))
     equity = get_account_equity(trading_client)
     risk_amount = equity * risk_pct
-    MIN_RISK_PER_SHARE = 0.50  # floor to stop runaway qty from tiny ATR stops
-    MAX_CAPITAL_PCT = 0.20      # never deploy more than 20% of equity on one trade
+
+    # SAFETY: Floor risk per share to avoid absurdly high qty on tiny stops
+    MIN_RISK_PER_SHARE = 0.50
+    # SAFETY: Max capital allocation for a single trade (e.g. 25% of equity)
+    MAX_CAPITAL_PCT = 0.25
+
     safe_risk_per_share = max(risk_per_share, MIN_RISK_PER_SHARE)
     qty_by_risk = int(risk_amount // safe_risk_per_share)
     qty_by_capital = int((equity * MAX_CAPITAL_PCT) // order_signal["entry_reference"])
     qty = max(0, min(qty_by_risk, qty_by_capital))
+
     LOG.info(
         "Position sizing: equity=%.2f risk_pct=%.4f risk_amount=%.2f risk_per_share=%.4f "
         "qty_by_risk=%s qty_by_capital=%s qty_final=%s",
