@@ -80,7 +80,7 @@ def final_config() -> StrategyConfig:
         ema_confluence_pct=0.8,
         atr_length=20,
         atr_stop_buffer_mult=0.2,
-        rr_target=2.0,
+        rr_target=1.5,
         trailing_stop_enabled=False,
         trailing_atr_mult=1.0,
         enabled_patterns=["liquidity_sweep", "rsi_div", "engulfing", "pin_bar"],
@@ -95,11 +95,11 @@ def state_path() -> Path:
 def load_state() -> dict:
     path = state_path()
     if not path.exists():
-        return {"loss_streak": 0, "last_loss_order_id": "", "last_trade_day": "", "trades_today": 0}
+        return {"loss_streak": 0, "last_loss_order_id": "", "last_trade_day": "", "trades_today": 0, "last_logged_trade_id": ""}
     try:
         return json.loads(path.read_text())
     except Exception:
-        return {"loss_streak": 0, "last_loss_order_id": "", "last_trade_day": "", "trades_today": 0}
+        return {"loss_streak": 0, "last_loss_order_id": "", "last_trade_day": "", "trades_today": 0, "last_logged_trade_id": ""}
 
 
 def save_state(state: dict) -> None:
@@ -418,6 +418,34 @@ def update_loss_streak_from_broker(trading_client, symbol: str, state: dict) -> 
     return state
 
 
+def log_latest_trade_outcome(trading_client, symbol: str, state: dict) -> dict:
+    """Fetches closed orders and logs the result of the most recent trade if not already logged."""
+    closed_orders = get_recent_closed_orders(trading_client, symbol)
+    completed = extract_completed_trade_outcomes(closed_orders)
+
+    if not completed:
+        return state
+
+    latest = completed[-1]
+    trade_id = latest["entry_client_order_id"]
+    if not trade_id or state.get("last_logged_trade_id") == trade_id:
+        return state
+
+    pnl = latest["pnl_per_share"]
+    won = latest["won"]
+    side = latest["direction"]
+    status = "WIN" if won else "LOSS"
+
+    LOG.info(
+        "TRADE CLOSED: %s | Side: %s | PnL/Share: %.2f | Result: %s | ID: %s",
+        latest["submitted_at"], side, pnl, status, trade_id
+    )
+
+    state["last_logged_trade_id"] = trade_id
+    return state
+
+
+
 def signal_to_order(latest_complete_df: pd.DataFrame, config: StrategyConfig):
     frame = prepare_strategy_frame(latest_complete_df, config)
 
@@ -536,8 +564,10 @@ def execute_once() -> int:
     now_ts = time.time()
     if now_ts - _last_streak_check >= 300:
         state = update_loss_streak_from_broker(trading_client, config.symbol, state)
+        state = log_latest_trade_outcome(trading_client, config.symbol, state)
         _last_streak_check = now_ts
         save_state(state)
+
 
     if eod_sweep(trading_client, config.symbol):
         return 0
@@ -617,7 +647,7 @@ def execute_once() -> int:
     # SAFETY: Floor risk per share to avoid absurdly high qty on tiny stops
     MIN_RISK_PER_SHARE = 0.50
     # SAFETY: Max capital allocation for a single trade (e.g. 25% of equity)
-    MAX_CAPITAL_PCT = 0.25
+    MAX_CAPITAL_PCT = 1.0
 
     safe_risk_per_share = max(risk_per_share, MIN_RISK_PER_SHARE)
     qty_by_risk = int(risk_amount // safe_risk_per_share)
