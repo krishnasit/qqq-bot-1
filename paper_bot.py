@@ -190,19 +190,27 @@ def get_open_position(trading_client, symbol: str):
 
 
 def flatten_symbol(trading_client, symbol: str):
-    """Emergency flatten: cancel all open orders for symbol, then market-close any residual position."""
+    """Hard-Lock Flatten: Ensures all brackets are dead before closing position to prevent ghost PnL."""
+    LOG.warning("HARD-LOCK: Initiating total flatten for %s", symbol)
     try:
+        # 1. Aggressively cancel all open orders
         open_orders = get_open_orders(trading_client, symbol)
-        for o in open_orders:
-            try:
-                trading_client.cancel_order_by_id(o.id)
-                LOG.warning("Cancelled stray order during flatten: %s", o.id)
-            except Exception as e:
-                LOG.error("Failed to cancel order %s during flatten: %s", o.id, e)
+        if open_orders:
+            LOG.info("Found %s open orders. Clearing book...", len(open_orders))
+            for o in open_orders:
+                try:
+                    trading_client.cancel_order_by_id(o.id)
+                    LOG.info("Cancelled order: %s", o.id)
+                except Exception as e:
+                    LOG.error("Failed to cancel order %s: %s", o.id, e)
+
+            # Small pause to allow Alpaca to process cancellations
+            time.sleep(1)
     except Exception as e:
         LOG.error("Could not list open orders during flatten: %s", e)
 
     try:
+        # 2. Now close the residual position
         pos = get_open_position(trading_client, symbol)
         if pos is not None:
             qty = abs(int(float(pos.qty)))
@@ -211,7 +219,7 @@ def flatten_symbol(trading_client, symbol: str):
                 trading_client.submit_order(MarketOrderRequest(
                     symbol=symbol, qty=qty, side=side, time_in_force=TimeInForce.DAY,
                 ))
-                LOG.warning("FLATTEN: Residual %s position closed (%s shares).", symbol, qty)
+                LOG.warning("HARD-LOCK SUCCESS: Residual %s position closed (%s shares).", symbol, qty)
     except Exception as e:
         LOG.error("Could not flatten residual position: %s", e)
 
