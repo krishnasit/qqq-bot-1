@@ -324,6 +324,7 @@ def extract_completed_trade_outcomes(closed_orders):
         status = str(_safe_attr(order, "status", default="") or "").lower()
         client_order_id = str(_safe_attr(order, "client_order_id", default="") or "")
         filled_avg_price = _to_float(_safe_attr(order, "filled_avg_price", "filled_avg", default=None))
+        qty = _to_float(_safe_attr(order, "filled_avg_qty", "qty", default=None))
         submitted_at = str(_safe_attr(order, "submitted_at", "created_at", "filled_at", default="") or "")
         order_class = str(_safe_attr(order, "order_class", default="") or "").lower()
         parent_order_id = str(_safe_attr(order, "parent_order_id", default="") or "")
@@ -335,6 +336,7 @@ def extract_completed_trade_outcomes(closed_orders):
             "id": oid,
             "side": side,
             "filled_avg_price": filled_avg_price,
+            "qty": qty,
             "submitted_at": submitted_at,
             "client_order_id": client_order_id,
             "order_class": order_class,
@@ -382,6 +384,7 @@ def extract_completed_trade_outcomes(closed_orders):
                 "direction": direction,
                 "entry_price": entry_price,
                 "exit_price": exit_price,
+                "qty": entry["qty"],
                 "won": won,
                 "pnl_per_share": pnl,
                 "submitted_at": entry["submitted_at"],
@@ -431,18 +434,51 @@ def log_latest_trade_outcome(trading_client, symbol: str, state: dict) -> dict:
     if not trade_id or state.get("last_logged_trade_id") == trade_id:
         return state
 
-    pnl = latest["pnl_per_share"]
+    pnl_per_share = latest["pnl_per_share"]
+    qty = latest.get("qty", 0) or 0
+    total_pnl = pnl_per_share * qty
     won = latest["won"]
     side = latest["direction"]
     status = "WIN" if won else "LOSS"
 
+    # 1. Standard Railway Log
     LOG.info(
-        "TRADE CLOSED: %s | Side: %s | PnL/Share: %.2f | Result: %s | ID: %s",
-        latest["submitted_at"], side, pnl, status, trade_id
+        "TRADE CLOSED: %s | Side: %s | PnL/Share: %.2f | Total PnL: %.2f | Result: %s | ID: %s",
+        latest["submitted_at"], side, pnl_per_share, total_pnl, status, trade_id
     )
+
+    # 2. Save to CSV Log
+    log_path = os.getenv("BOT_LOG_PATH", "paper_trades.csv")
+    append_log(log_path, {
+        "logged_at": datetime.now(timezone.utc).isoformat(),
+        "event": "trade_closed",
+        "symbol": symbol,
+        "signal_timestamp": latest["submitted_at"],
+        "side": side,
+        "entry_reference": latest["entry_price"],
+        "exit_price": latest["exit_price"],
+        "pnl_per_share": pnl_per_share,
+        "total_pnl": total_pnl,
+        "client_order_id": trade_id,
+        "message": f"Trade closed as {status}",
+    })
+
+    # 3. Telegram Notification
+    emoji = "✅" if won else "❌"
+    msg = (
+        f"{emoji} QQQ Trade Closed\n"
+        f"Result: {status}\n"
+        f"Side: {side.upper()}\n"
+        f"Entry: {latest['entry_price']:.2f}\n"
+        f"Exit: {latest['exit_price']:.2f}\n"
+        f"PnL/Share: {pnl_per_share:.2f}\n"
+        f"Total PnL: ${total_pnl:.2f}"
+    )
+    send_telegram(msg)
 
     state["last_logged_trade_id"] = trade_id
     return state
+
 
 
 
@@ -527,6 +563,9 @@ def append_log(csv_path: str, row: dict):
         "pattern",
         "client_order_id",
         "broker_order_id",
+        "exit_price",
+        "pnl_per_share",
+        "total_pnl",
         "message",
     ]
 
