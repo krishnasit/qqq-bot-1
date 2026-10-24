@@ -25,3 +25,9 @@ local_backtest.py
 sweep_readonly.py
 logger.py
 *.code-workspace
+
+.env*
+!.env.example
+backup_pre_*/
+*.backup_*
+alpaca_*.csv
