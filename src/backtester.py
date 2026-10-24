@@ -33,12 +33,17 @@ def prepare_strategy_frame(df: pd.DataFrame, config) -> pd.DataFrame:
 
     # 1. HTF Bias (Using a 1-hour approximation from 5m bars)
     # 1h Trend = Price > SMA(20) of 1h Close
-    resampled_1h = out["close"].resample('h').last()
-    sma_1h = resampled_1h.rolling(20).mean()
-    bias_1h = (resampled_1h > sma_1h).astype(int)
-    # Map 1h bias back to 5m index
-    out["htf_bias_raw"] = bias_1h.reindex(out.index, method='ffill')
-    out["bias"] = out["htf_bias_raw"].apply(lambda x: "long" if x == 1 else "short")
+    resampled_1h = out["close"].resample("h").last().dropna()
+    sma_1h = resampled_1h.rolling(20, min_periods=20).mean()
+
+    # Preserve missing warm-up values; do not silently turn them into short signals.
+    bias_1h = pd.Series(index=resampled_1h.index, dtype="object")
+    bias_1h.loc[resampled_1h > sma_1h] = "long"
+    bias_1h.loc[resampled_1h < sma_1h] = "short"
+
+    # Map the last completed, valid hourly bias onto each 5-minute bar.
+    out["bias"] = bias_1h.reindex(out.index, method="ffill")
+    out["htf_bias_raw"] = out["bias"]
 
     # 2. Daily Levels for Structural Sweeps
     # Get daily high/low and shift by 1 to get "Previous Day"

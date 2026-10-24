@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).parent))
+
 import argparse
 import csv
 import hashlib
@@ -89,7 +93,7 @@ def final_config() -> StrategyConfig:
 
 
 def state_path() -> Path:
-    return Path(os.getenv("BOT_STATE_PATH", "paper_bot_state.json"))
+    return Path(os.getenv("BOT_STATE_PATH", "data/paper_bot_state.json"))
 
 
 def load_state() -> dict:
@@ -103,6 +107,7 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
+    state_path().parent.mkdir(parents=True, exist_ok=True)
     state_path().write_text(json.dumps(state, indent=2, sort_keys=True))
 
 
@@ -138,10 +143,14 @@ def get_account_equity(trading_client) -> float:
     return float(account.equity)
 
 
+def _ny_now():
+    return pd.Timestamp.now(tz="UTC").tz_convert("America/New_York")
+
+
 def in_regular_session() -> bool:
-    now = datetime.now(timezone.utc)
+    now = _ny_now()
     minutes = now.hour * 60 + now.minute
-    return now.weekday() < 5 and (13 * 60 + 30) <= minutes < (20 * 60)
+    return now.weekday() < 5 and (9 * 60 + 30) <= minutes < (16 * 60)
 
 
 def fetch_recent_bars(data_client, symbol: str, lookback_days: int = 10, limit: int = 500) -> pd.DataFrame:
@@ -204,8 +213,13 @@ def flatten_symbol(trading_client, symbol: str):
                 except Exception as e:
                     LOG.error("Failed to cancel order %s: %s", o.id, e)
 
-            # Small pause to allow Alpaca to process cancellations
-            time.sleep(1)
+            for _ in range(10):
+                time.sleep(1)
+                try:
+                    if not get_open_orders(trading_client, symbol):
+                        break
+                except Exception:
+                    pass
     except Exception as e:
         LOG.error("Could not list open orders during flatten: %s", e)
 
@@ -249,15 +263,15 @@ def verify_flat_or_fix(trading_client, symbol: str) -> bool:
 
 def eod_sweep(trading_client, symbol: str) -> bool:
     """Flatten everything 5 min before regular session close (20:00 UTC). Returns True if it acted."""
-    now = datetime.now(timezone.utc)
+    now = _ny_now()
     minutes = now.hour * 60 + now.minute
-    eod_trigger = (19 * 60 + 55)
-    eod_hard_close = (20 * 60)
+    eod_trigger = (15 * 60 + 55)
+    eod_hard_close = (16 * 60)
     if eod_trigger <= minutes < eod_hard_close:
         pos = get_open_position(trading_client, symbol)
         orders = get_open_orders(trading_client, symbol)
         if pos is not None or orders:
-            LOG.warning("EOD SWEEP triggered at %s UTC for %s.", now.strftime("%H:%M"), symbol)
+            LOG.warning("EOD SWEEP triggered at %s ET for %s.", now.strftime("%H:%M"), symbol)
             flatten_symbol(trading_client, symbol)
             return True
     return False
@@ -456,7 +470,7 @@ def log_latest_trade_outcome(trading_client, symbol: str, state: dict) -> dict:
     )
 
     # 2. Save to CSV Log
-    log_path = os.getenv("BOT_LOG_PATH", "paper_trades.csv")
+    log_path = os.getenv("BOT_LOG_PATH", "data/paper_trades.csv")
     append_log(log_path, {
         "logged_at": datetime.now(timezone.utc).isoformat(),
         "event": "trade_closed",
@@ -588,6 +602,32 @@ def append_log(csv_path: str, row: dict):
 _cached_clients: dict = {}
 _last_streak_check: float = 0.0
 
+_broker_count_cache = {"ts": 0.0, "n": None}
+
+
+def count_orders_today_from_broker(trading_client, symbol: str):
+    """Count today's bracket entries from Alpaca so a restart cannot reset the daily cap."""
+    if time.time() - _broker_count_cache["ts"] < 30:
+        return _broker_count_cache["n"]
+    try:
+        from alpaca.trading.requests import GetOrdersRequest
+        start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        orders = trading_client.get_orders(GetOrdersRequest(
+            status=QueryOrderStatus.ALL, after=start, symbols=[symbol], nested=True, limit=500))
+        n = 0
+        for o in orders:
+            if "bracket" not in str(getattr(o, "order_class", "")).lower():
+                continue
+            if str(getattr(o, "status", "")).lower().split(".")[-1] in {"canceled", "rejected", "expired"}:
+                continue
+            n += 1
+        _broker_count_cache.update(ts=time.time(), n=n)
+        return n
+    except Exception as e:
+        LOG.warning("Could not count today's orders from broker: %s", e)
+        return _broker_count_cache["n"]
+
+
 def execute_once() -> int:
     global _cached_clients, _last_streak_check
     config = final_config()
@@ -600,16 +640,19 @@ def execute_once() -> int:
     trading_client = _cached_clients["trading"]
     data_client = _cached_clients["data"]
 
-    log_path = os.getenv("BOT_LOG_PATH", "paper_trades.csv")
+    log_path = os.getenv("BOT_LOG_PATH", "data/paper_trades.csv")
     max_consecutive_losses = int(os.getenv("BOT_MAX_CONSECUTIVE_LOSSES", "3"))
     max_trades_per_day = int(os.getenv("BOT_MAX_TRADES_PER_DAY", "5"))
 
     state = load_state()
     state = reset_daily_counters_if_needed(state)
+    _bc = count_orders_today_from_broker(trading_client, config.symbol)
+    if _bc is not None:
+        state["trades_today"] = max(int(state.get("trades_today", 0)), _bc)
 
     # Only refresh loss streak from broker every 5 minutes — not every 5-second poll
     now_ts = time.time()
-    if now_ts - _last_streak_check >= 300:
+    if now_ts - _last_streak_check >= 60:
         state = update_loss_streak_from_broker(trading_client, config.symbol, state)
         state = log_latest_trade_outcome(trading_client, config.symbol, state)
         _last_streak_check = now_ts
@@ -667,7 +710,12 @@ def execute_once() -> int:
         LOG.info("Not enough bars yet.")
         return 0
 
-    latest_complete = bars.iloc[:-1].copy()
+    bar_delta = pd.Timedelta(minutes=config.timeframe_minutes)
+    cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(seconds=1)
+    latest_complete = bars[bars.index + bar_delta <= cutoff].copy()
+    if len(latest_complete) < 3:
+        LOG.info("Not enough completed bars yet.")
+        return 0
 
     # Dedup: skip if we already acted on this exact candle
     last_candle_key = latest_complete.index[-1].isoformat()

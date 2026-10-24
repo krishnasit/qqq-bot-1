@@ -4,8 +4,7 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "python3 paper_bot.py --loop",
-    "restartPolicyType": "ON_FAILURE",
-    "restartPolicyMaxRetries": 10
+    "startCommand": "python3 src/paper_bot.py --loop",
+    "restartPolicyType": "ALWAYS"
   }
 }
